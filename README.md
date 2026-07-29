@@ -97,6 +97,120 @@ To install on your phone: connect it via USB and run `flutter run -d
 <device-id>` (see `flutter devices`), or build a release APK/IPA with
 `flutter build apk` / `flutter build ios`.
 
+## 4. Daily fleet report (S3)
+
+On top of the live dashboard, each Pi can upload one stats snapshot a day to
+S3, and one designated Pi builds a single combined status page from all of
+them and publishes it as a plain webpage — useful for a quick "is everything
+still alive" check without opening the app.
+
+### 4.1 Create the bucket and IAM policies (once)
+
+```bash
+aws s3api create-bucket --bucket your-pi-reports-bucket --region us-east-1
+```
+
+Keep the bucket private overall — raw per-Pi JSON snapshots aren't meant to
+be public. Give each Pi write-only access to just its own folder:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::your-pi-reports-bucket/reports/<hostname>/*"
+  }]
+}
+```
+
+The aggregator Pi needs broader access — list/read everything under
+`reports/`, plus write the combined page:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::your-pi-reports-bucket",
+      "Condition": {"StringLike": {"s3:prefix": "reports/*"}}
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::your-pi-reports-bucket/reports/*"
+    }
+  ]
+}
+```
+
+Create an IAM user per role above (or per Pi), generate access keys, and put
+them in each Pi's environment (`~/.aws/credentials` via `aws configure`, or
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in `.env`) — `boto3` picks either
+up automatically.
+
+Only the combined report should be public. Turn on static website hosting
+and scope public read to that one object, not the whole bucket:
+
+```bash
+aws s3api put-bucket-website --bucket your-pi-reports-bucket \
+  --website-configuration '{"IndexDocument": {"Suffix": "index.html"}}'
+aws s3api put-public-access-block --bucket your-pi-reports-bucket \
+  --public-access-block-configuration BlockPublicPolicy=false,RestrictPublicBuckets=false,BlockPublicAcls=true,IgnorePublicAcls=true
+```
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::your-pi-reports-bucket/reports/index.html"
+  }]
+}
+```
+
+Apply it with `aws s3api put-bucket-policy --bucket your-pi-reports-bucket
+--policy file://policy.json`. The page will then be reachable at
+`http://your-pi-reports-bucket.s3-website-<region>.amazonaws.com/reports/index.html`
+(HTTP only — put CloudFront in front if you want HTTPS).
+
+### 4.2 Set up every Pi
+
+Add `PI_REPORT_BUCKET` (and AWS credentials) to each Pi's `.env` — see
+`.env.example`. Then install and enable the snapshot timer:
+
+```bash
+sudo cp pi-report.service pi-report.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-report.timer
+```
+
+Test it immediately rather than waiting for 06:00:
+
+```bash
+sudo systemctl start pi-report.service
+sudo journalctl -u pi-report.service -n 20
+```
+
+### 4.3 Set up the aggregator (one Pi only)
+
+Pick one Pi to be the aggregator (any one that's reliably on). It needs the
+broader IAM policy from 4.1. Install its timer too:
+
+```bash
+sudo cp pi-aggregate.service pi-aggregate.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-aggregate.timer
+sudo systemctl start pi-aggregate.service   # test now
+```
+
+It runs at 06:20, 20 minutes after the per-Pi snapshot timers, so every Pi
+has had a chance to upload first.
+
 ## Notes / next steps
 
 - Process `cpu_percent` from `psutil` needs two samples to be accurate —
@@ -109,3 +223,11 @@ To install on your phone: connect it via USB and run `flutter run -d
   server you run yourself, or an SSH reverse tunnel — both need more
   manual setup and certificate/key management than Tailscale's zero-config
   mesh.
+- The combined S3 report (`reports/index.html`) is publicly reachable to
+  anyone with the URL — there's no auth on S3 static website hosting. It
+  only contains CPU/mem/disk/temp numbers, no hostnames-as-secrets or
+  process lists, but don't share the URL if you'd rather it stayed private;
+  swap the public bucket policy for presigned URLs if that matters to you.
+- A Pi shows as `STALE` on the combined report if its last snapshot is
+  older than `PI_REPORT_STALE_HOURS` (default 36h) — that's the signal an
+  agent crashed, the Pi is off, or it lost network before its daily upload.

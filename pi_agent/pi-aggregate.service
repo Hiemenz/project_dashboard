@@ -1,0 +1,11 @@
+[Unit]
+Description=Build combined Pi fleet report and publish to S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/pi_agent
+EnvironmentFile=/home/pi/pi_agent/.env
+ExecStart=/home/pi/.local/bin/poetry run python -m pi_agent.aggregate_report
